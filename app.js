@@ -1,4 +1,4 @@
-/* ═══ app.js — ChestXray AI Diagnostic Tool ═══ */
+/* ═══ app.js — ChestXray AI Diagnostic Tool (Batch Mode) ═══ */
 
 // ── Config ────────────────────────────────────────────────────────────
 const CLASS_NAMES  = ['COVID19', 'Normal', 'Pneumonia', 'Tuberculosis'];
@@ -12,8 +12,17 @@ const CLASS_ICONS = {
   COVID19: '🦠', Normal: '✅', Pneumonia: '🫁', Tuberculosis: '🧬'
 };
 
+const MAX_FILES = 40;
+
 // Replace this URL with your Flask server address when running locally or on Colab+ngrok
 const API_URL = null; // e.g. "http://localhost:5000/predict"
+
+// ── OOD Guard config ──────────────────────────────────────────────────
+// The model has a closed-set softmax over 4 classes only — it cannot say
+// "this isn't an X-ray at all". These guards catch obviously-wrong uploads
+// (photos, scanned notes, screenshots) before/after inference.
+const CONFIDENCE_THRESHOLD = 0.55; // below this max-prob → flag as uncertain
+const ENTROPY_THRESHOLD    = 1.2;  // bits; above this → flag as uncertain (max for 4 classes = 2.0)
 
 let tfModel = null;
 async function loadTFModel() {
@@ -34,45 +43,54 @@ async function loadTFModel() {
 }
 loadTFModel();
 
+const maxFilesLabelEl = document.getElementById('maxFilesLabel');
+if (maxFilesLabelEl) maxFilesLabelEl.textContent = MAX_FILES;
+
 // ── DOM ───────────────────────────────────────────────────────────────
-const dropZone        = document.getElementById('dropZone');
-const fileInput       = document.getElementById('fileInput');
-const browseBtn       = document.getElementById('browseBtn');
-const previewContainer= document.getElementById('previewContainer');
-const previewImg      = document.getElementById('previewImg');
-const previewMeta     = document.getElementById('previewMeta');
-const scanLine        = document.getElementById('scanLine');
-const resetBtn        = document.getElementById('resetBtn');
-const analyzeBtn      = document.getElementById('analyzeBtn');
-const analyzeBtnTxt   = document.getElementById('analyzeBtnTxt');
+const dropZone         = document.getElementById('dropZone');
+const fileInput        = document.getElementById('fileInput');
+const browseBtn        = document.getElementById('browseBtn');
+const addMoreBtn       = document.getElementById('addMoreBtn');
+const batchPreview     = document.getElementById('batchPreview');
+const batchThumbGrid   = document.getElementById('batchThumbGrid');
+const batchCountLabel  = document.getElementById('batchCountLabel');
+const resetBtn         = document.getElementById('resetBtn');
+const analyzeBtn       = document.getElementById('analyzeBtn');
+const analyzeBtnTxt    = document.getElementById('analyzeBtnTxt');
 
-const emptyState      = document.getElementById('emptyState');
-const loadingState    = document.getElementById('loadingState');
-const resultsContent  = document.getElementById('resultsContent');
+const emptyState        = document.getElementById('emptyState');
+const loadingState      = document.getElementById('loadingState');
+const loadingTxt        = document.getElementById('loadingTxt');
+const batchProgressFill = document.getElementById('batchProgressFill');
+const batchProgressLbl  = document.getElementById('batchProgressLbl');
+const resultsContent    = document.getElementById('resultsContent');
 
-const verdictClass    = document.getElementById('verdictClass');
-const verdictConf     = document.getElementById('verdictConf');
-const verdictIcon     = document.getElementById('verdictIcon');
-const verdictCard     = document.getElementById('verdictCard');
-const classBars       = document.getElementById('classBars');
-const summaryGrid     = document.getElementById('summaryGrid');
+const batchSummaryGrid  = document.getElementById('batchSummaryGrid');
+const resultCardsGrid   = document.getElementById('resultCardsGrid');
 
-let currentFile  = null;
-let currentImage = null; // HTMLImageElement for canvas drawing
+const detailView       = document.getElementById('detailView');
+const detailFileName   = document.getElementById('detailFileName');
+const closeDetailBtn   = document.getElementById('closeDetailBtn');
+const verdictClass     = document.getElementById('verdictClass');
+const verdictConf      = document.getElementById('verdictConf');
+const verdictIcon      = document.getElementById('verdictIcon');
+const verdictCard      = document.getElementById('verdictCard');
+const classBars        = document.getElementById('classBars');
+const summaryGrid       = document.getElementById('summaryGrid');
 
-// ── OOD Guard config ──────────────────────────────────────────────────
-// The model has a closed-set softmax over 4 classes only — it cannot say
-// "this isn't an X-ray at all". These guards catch obviously-wrong uploads
-// (photos, scanned notes, screenshots) before/after inference.
-const CONFIDENCE_THRESHOLD = 0.55; // below this max-prob → flag as uncertain
-const ENTROPY_THRESHOLD    = 1.2;  // bits; above this → flag as uncertain (max for 4 classes = 2.0)
+// ── State ─────────────────────────────────────────────────────────────
+// items: [{ file, url, img (HTMLImageElement, loaded lazily), name }]
+let items   = [];
+let results = []; // parallel array to items, filled after analysis
 
 // ── Upload Handlers ───────────────────────────────────────────────────
 browseBtn.addEventListener('click', () => fileInput.click());
+addMoreBtn.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('click', (e) => { if (e.target !== browseBtn) fileInput.click(); });
 
 fileInput.addEventListener('change', (e) => {
-  if (e.target.files[0]) handleFile(e.target.files[0]);
+  addFiles(Array.from(e.target.files));
+  fileInput.value = ''; // allow re-selecting the same file(s) later
 });
 
 dropZone.addEventListener('dragover', (e) => {
@@ -81,54 +99,111 @@ dropZone.addEventListener('dragover', (e) => {
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault(); dropZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith('image/')) handleFile(file);
+  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
+  addFiles(files);
 });
 
 resetBtn.addEventListener('click', resetAll);
+closeDetailBtn.addEventListener('click', () => hide(detailView));
 
-// ── Handle File ───────────────────────────────────────────────────────
-function handleFile(file) {
-  currentFile = file;
-  const url   = URL.createObjectURL(file);
-  previewImg.src = url;
+// ── Add files to the batch ───────────────────────────────────────────
+function addFiles(newFiles) {
+  if (!newFiles.length) return;
 
-  previewImg.onload = () => {
-    currentImage = previewImg;
-    previewMeta.textContent =
-      `${file.name}  |  ${(file.size / 1024).toFixed(1)} KB  |  ${previewImg.naturalWidth}×${previewImg.naturalHeight}px`;
-  };
+  let room = MAX_FILES - items.length;
+  if (room <= 0) {
+    alert(`⚠️ You've already loaded the maximum of ${MAX_FILES} images.\n\nRemove some before adding more, or click "Clear All" to start over.`);
+    return;
+  }
 
+  const accepted = newFiles.slice(0, room);
+  const rejected = newFiles.length - accepted.length;
+
+  accepted.forEach(file => {
+    const url = URL.createObjectURL(file);
+    const entry = { file, url, name: file.name, size: file.size, img: null, loadError: false };
+    const imgEl = new Image();
+    imgEl.onload  = () => { entry.img = imgEl; };
+    imgEl.onerror = () => { entry.loadError = true; };
+    imgEl.src = url;
+    items.push(entry);
+  });
+
+  if (rejected > 0) {
+    alert(`⚠️ Only ${accepted.length} of ${newFiles.length} images were added — the ${MAX_FILES}-image limit was reached. ${rejected} file(s) were skipped.`);
+  }
+
+  renderThumbGrid();
   dropZone.classList.add('hidden');
-  previewContainer.classList.remove('hidden');
-  analyzeBtn.disabled = false;
-  resetState();
+  batchPreview.classList.remove('hidden');
+  analyzeBtn.disabled = items.length === 0;
+  analyzeBtnTxt.textContent = `⚡ Analyze ${items.length} X-Ray${items.length === 1 ? '' : 's'}`;
+  resetResultsUI();
+}
+
+function removeItem(idx) {
+  URL.revokeObjectURL(items[idx].url);
+  items.splice(idx, 1);
+  renderThumbGrid();
+  analyzeBtnTxt.textContent = `⚡ Analyze ${items.length} X-Ray${items.length === 1 ? '' : 's'}`;
+  analyzeBtn.disabled = items.length === 0;
+  if (items.length === 0) {
+    dropZone.classList.remove('hidden');
+    batchPreview.classList.add('hidden');
+  }
+}
+
+function renderThumbGrid() {
+  batchCountLabel.textContent = `📷 ${items.length} / ${MAX_FILES} Images Loaded`;
+  batchThumbGrid.innerHTML = '';
+  items.forEach((it, idx) => {
+    const el = document.createElement('div');
+    el.className = 'thumb-item';
+    el.innerHTML = `
+      <img src="${it.url}" alt="${escapeHtml(it.name)}" />
+      <button class="thumb-remove" data-idx="${idx}" title="Remove">✕</button>
+      <span class="thumb-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>
+    `;
+    batchThumbGrid.appendChild(el);
+  });
+  batchThumbGrid.querySelectorAll('.thumb-remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeItem(parseInt(btn.dataset.idx, 10));
+    });
+  });
 }
 
 function resetAll() {
-  currentFile  = null;
-  currentImage = null;
+  items.forEach(it => URL.revokeObjectURL(it.url));
+  items = [];
+  results = [];
   fileInput.value = '';
-  previewImg.src  = '';
+  batchThumbGrid.innerHTML = '';
   dropZone.classList.remove('hidden');
-  previewContainer.classList.add('hidden');
+  batchPreview.classList.add('hidden');
   analyzeBtn.disabled = true;
-  analyzeBtnTxt.textContent = '⚡ Analyze X-Ray';
-  resetState();
+  analyzeBtnTxt.textContent = '⚡ Analyze X-Rays';
+  resetResultsUI();
 }
 
-function resetState() {
+function resetResultsUI() {
   show(emptyState);
   hide(loadingState);
   hide(resultsContent);
-  scanLine.classList.remove('active');
+  hide(detailView);
 }
 
 // ── OOD / "does this even look like an X-ray?" pre-filter ─────────────
-// Chest X-rays are near-grayscale with a fairly narrow intensity profile.
-// Photos, screenshots, and scanned notes are usually colorful or blown-out
-// white/black across the frame. This is a heuristic, not a real classifier —
-// it won't catch everything, but it stops the most obvious mismatches.
+// Chest X-rays have a distinct visual signature: mostly grayscale, a broad
+// spread of mid-gray tones from anatomical structures, and a fairly dark
+// overall look (dark background/air regions around a lighter torso). This
+// is what distinguishes them from things that can otherwise sneak past a
+// simple "is it grayscale?" check — scanned documents and charts are also
+// low-saturation, but they're dominated by a near-white background with
+// sparse black text or flat color blocks, not a broad continuous gray
+// gradient. This is still a heuristic, not a real classifier, but checking
+// tone spread + midtone content catches those cases too.
 function isLikelyXray(img) {
   const c = document.createElement('canvas');
   const size = 64;
@@ -137,7 +212,8 @@ function isLikelyXray(img) {
   ctx.drawImage(img, 0, 0, size, size);
   const data = ctx.getImageData(0, 0, size, size).data;
 
-  let satSum = 0, grayLikeCount = 0, meanLum = 0;
+  let satSum = 0, grayLikeCount = 0, meanLum = 0, midtoneCount = 0, coloredPatchCount = 0;
+  const lums = [];
   const n = size * size;
 
   for (let i = 0; i < data.length; i += 4) {
@@ -146,123 +222,229 @@ function isLikelyXray(img) {
     const sat = max === 0 ? 0 : (max - min) / max;
     satSum += sat;
     if (Math.abs(r - g) < 12 && Math.abs(g - b) < 12) grayLikeCount++;
-    meanLum += (r + g + b) / 3;
+    // Individually-saturated pixels (a stamp, a signature, a colored logo) —
+    // real X-ray film/exports are always monochrome, so any real patch of
+    // strong color is a giveaway even if it's a small part of the image and
+    // gets diluted out of the *average* saturation.
+    if (sat > 0.35 && max > 60) coloredPatchCount++;
+    const lum = (r + g + b) / 3;
+    meanLum += lum;
+    lums.push(lum);
+    if (lum >= 50 && lum <= 200) midtoneCount++;
   }
 
-  const avgSat   = satSum / n;
-  const grayFrac = grayLikeCount / n;
+  const avgSat        = satSum / n;
+  const grayFrac       = grayLikeCount / n;
   meanLum /= n;
+  const midtoneFrac    = midtoneCount / n;
+  const coloredPatchFrac = coloredPatchCount / n;
 
-  const looksGray    = avgSat < 0.08 && grayFrac > 0.85;
-  const notBlankPage = meanLum > 15 && meanLum < 245;
+  let variance = 0;
+  for (const l of lums) variance += (l - meanLum) ** 2;
+  const stdLum = Math.sqrt(variance / n);
 
-  return looksGray && notBlankPage;
+  const looksGray      = avgSat < 0.12 && grayFrac > 0.75;
+  const plausibleTone  = meanLum > 35 && meanLum < 205;
+  const hasTexture     = midtoneFrac > 0.30 && stdLum > 20;
+  const noColoredMarks = coloredPatchFrac < 0.015; // reject stamps/signatures/logos
+
+  return looksGray && plausibleTone && hasTexture && noColoredMarks;
 }
 
-// ── Analyze ───────────────────────────────────────────────────────────
+// ── Analyze (batch) ─────────────────────────────────────────────────
 analyzeBtn.addEventListener('click', async () => {
-  if (!currentFile) return;
+  if (items.length === 0) return;
 
-  if (!isLikelyXray(currentImage)) {
-    alert(
-      "⚠️ This doesn't look like a grayscale chest X-ray.\n\n" +
-      "This model is only trained to classify chest X-rays into COVID-19 / " +
-      "Normal / Pneumonia / Tuberculosis, and will produce meaningless " +
-      "results on other images (photos, scanned notes, screenshots, etc).\n\n" +
-      "Please upload a chest X-ray image."
-    );
-    return;
-  }
-
-  analyzeBtn.disabled  = true;
+  analyzeBtn.disabled = true;
   analyzeBtnTxt.textContent = '⏳ Analysing…';
-  scanLine.classList.add('active');
 
   hide(emptyState);
-  show(loadingState);
   hide(resultsContent);
+  hide(detailView);
+  show(loadingState);
+  batchProgressFill.style.width = '0%';
 
-  // Animate loading steps
-  const steps = ['step1','step2','step3','step4'];
-  for (let i = 0; i < steps.length; i++) {
-    await sleep(400);
-    document.getElementById(steps[i]).classList.add('active');
-  }
+  results = new Array(items.length).fill(null);
 
-  let predictions;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    loadingTxt.textContent = `Analysing ${it.name}…`;
+    batchProgressLbl.textContent = `${i} / ${items.length} images`;
+    batchProgressFill.style.width = `${(i / items.length) * 100}%`;
 
-  if (tfModel) {
-    // ── Real model via local TF.js
+    let flaggedNotXray = false;
+    let predictions = null;
+    let loadFailed = false;
+
     try {
-      predictions = await tfPredict();
-    } catch (e) {
-      console.error("TF.js prediction failed:", e);
-      alert('❌ TF.js Model inference failed.\n' + e.message + '\n\nShowing demo predictions instead.');
-      predictions = demoPredict();
-    }
-  } else if (API_URL) {
-    // ── Real model via Flask API
-    try {
-      const form = new FormData();
-      form.append('file', currentFile);
-      const res  = await fetch(API_URL, { method: 'POST', body: form });
-      const data = await res.json();
-      predictions = data.predictions; // { COVID19: 0.02, Normal: 0.93, ... }
+      // Make sure the image element has finished loading (bounded wait — never hangs the batch)
+      const loaded = await waitForImage(it);
+      if (!loaded) {
+        loadFailed = true;
+      } else if (!isLikelyXray(it.img)) {
+        flaggedNotXray = true;
+      } else if (tfModel) {
+        try {
+          predictions = await tfPredict(it.img);
+        } catch (e) {
+          console.error(`TF.js prediction failed for ${it.name}:`, e);
+          predictions = demoPredict();
+        }
+      } else if (API_URL) {
+        try {
+          const form = new FormData();
+          form.append('file', it.file);
+          const res  = await fetch(API_URL, { method: 'POST', body: form });
+          const data = await res.json();
+          predictions = data.predictions;
+        } catch (err) {
+          console.error(`API prediction failed for ${it.name}:`, err);
+          predictions = demoPredict();
+        }
+      } else {
+        await sleep(60); // small pacing so the progress bar is visible in demo mode
+        predictions = demoPredict();
+      }
     } catch (err) {
-      alert('❌ Could not connect to Flask API.\n' + err.message + '\n\nShowing demo predictions instead.');
-      predictions = demoPredict();
+      // Catch-all so one unexpected failure never stalls the rest of the batch
+      console.error(`Unexpected error analysing ${it.name}:`, err);
+      loadFailed = true;
     }
-  } else {
-    // ── Demo mode: simulate realistic prediction
-    await sleep(800);
-    predictions = demoPredict();
+
+    let isUncertain = flaggedNotXray || loadFailed;
+    let maxProb = 0, entropy = 0;
+    if (predictions && (tfModel || API_URL)) {
+      const vals = Object.values(predictions);
+      maxProb = Math.max(...vals);
+      entropy = -vals.filter(p => p > 0).reduce((s, p) => s + p * Math.log2(p), 0);
+      if (maxProb < CONFIDENCE_THRESHOLD || entropy > ENTROPY_THRESHOLD) isUncertain = true;
+    } else if (predictions) {
+      const vals = Object.values(predictions);
+      maxProb = Math.max(...vals);
+    }
+
+    results[i] = { predictions, isUncertain, flaggedNotXray, loadFailed, maxProb, entropy };
   }
 
-  await sleep(300);
+  batchProgressFill.style.width = '100%';
+  batchProgressLbl.textContent = `${items.length} / ${items.length} images`;
+  await sleep(200);
 
-  // ── Confidence/entropy gate on the model's own output ────────────────
-  // Only applied to real model output (TF.js/API), not the fabricated demo
-  // predictions, since demo mode isn't looking at pixels in the first place.
-  if (tfModel || API_URL) {
-    const vals    = Object.values(predictions);
-    const maxProb = Math.max(...vals);
-    const entropy = -vals.filter(p => p > 0).reduce((s, p) => s + p * Math.log2(p), 0);
-    if (maxProb < CONFIDENCE_THRESHOLD || entropy > ENTROPY_THRESHOLD) {
-      hide(loadingState);
-      show(resultsContent);
-      verdictClass.textContent = 'Uncertain';
-      verdictConf.textContent  = `Low confidence (${(maxProb * 100).toFixed(1)}%) — likely not a recognized X-ray pattern`;
-      verdictIcon.textContent  = '❓';
-      verdictCard.style.borderLeftColor = '#B0BEC5';
-      classBars.innerHTML   = '';
-      summaryGrid.innerHTML = '';
-      analyzeBtnTxt.textContent = '⚡ Analyze X-Ray';
-      analyzeBtn.disabled = false;
-      scanLine.classList.remove('active');
-      return;
-    }
-  }
+  hide(loadingState);
+  show(resultsContent);
+  renderBatchSummary();
+  renderResultCards();
 
-  displayResults(predictions);
-
-  analyzeBtnTxt.textContent = '⚡ Analyze X-Ray';
+  analyzeBtnTxt.textContent = `⚡ Analyze ${items.length} X-Ray${items.length === 1 ? '' : 's'}`;
   analyzeBtn.disabled = false;
-  scanLine.classList.remove('active');
 });
 
+function waitForImage(it, timeoutMs = 8000) {
+  if (it.img && it.img.complete) return Promise.resolve(true);
+  if (it.loadError) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const start = Date.now();
+    const check = () => {
+      if (it.img && it.img.complete) return resolve(true);
+      if (it.loadError) return resolve(false);
+      if (Date.now() - start > timeoutMs) return resolve(false); // give up, don't hang forever
+      setTimeout(check, 30);
+    };
+    check();
+  });
+}
+
+// ── OpenCV.js readiness ────────────────────────────────────────────────
+// Used to replicate the exact CLAHE preprocessing your training pipeline
+// applies (see xray_preprocess() in the notebook) — skipping it causes a
+// mismatch between training-time and inference-time input distributions,
+// which can make the model collapse onto one dominant class regardless of
+// the actual image.
+let cvReadyPromise = new Promise((resolve) => {
+  const check = () => {
+    if (typeof cv !== 'undefined' && cv.getBuildInformation) {
+      resolve(true); // already fully initialized
+    } else if (typeof cv !== 'undefined') {
+      cv['onRuntimeInitialized'] = () => resolve(true);
+    } else {
+      setTimeout(check, 100);
+    }
+  };
+  check();
+});
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(false), ms)),
+  ]);
+}
+
+// Applies the same CLAHE enhancement as the notebook's xray_preprocess():
+// LAB colorspace, CLAHE(clipLimit=2.5, tileGridSize=8x8) on the L channel.
+function applyCLAHE(canvas) {
+  const src = cv.imread(canvas);       // RGBA Mat
+  const rgb = new cv.Mat();
+  cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  const lab = new cv.Mat();
+  cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+
+  const planes = new cv.MatVector();
+  cv.split(lab, planes);
+  const L  = planes.get(0);
+  const Lc = new cv.Mat();
+  const clahe = new cv.CLAHE(2.5, new cv.Size(8, 8));
+  clahe.apply(L, Lc);
+  planes.set(0, Lc);
+
+  const labOut = new cv.Mat();
+  cv.merge(planes, labOut);
+  const rgbOut = new cv.Mat();
+  cv.cvtColor(labOut, rgbOut, cv.COLOR_Lab2RGB);
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = canvas.width;
+  outCanvas.height = canvas.height;
+  cv.imshow(outCanvas, rgbOut);
+
+  [src, rgb, lab, L, Lc, labOut, rgbOut, planes, clahe].forEach(m => m.delete());
+  return outCanvas;
+}
+
 // ── TF.js Local Predictor ─────────────────────────────────────────────
-async function tfPredict() {
+// Mirrors the notebook's xray_preprocess() exactly:
+//   resize(224,224) → CLAHE(LAB, clip=2.5, tiles=8x8) → DenseNet "torch"
+//   normalization: x/255, subtract ImageNet mean, divide by ImageNet std.
+async function tfPredict(imgEl) {
+  const resizeCanvas = document.createElement('canvas');
+  resizeCanvas.width = 224;
+  resizeCanvas.height = 224;
+  resizeCanvas.getContext('2d').drawImage(imgEl, 0, 0, 224, 224);
+
+  let inputCanvas = resizeCanvas;
+  const cvOk = await withTimeout(cvReadyPromise, 6000);
+  if (cvOk) {
+    try {
+      inputCanvas = applyCLAHE(resizeCanvas);
+    } catch (e) {
+      console.warn('CLAHE failed, falling back to plain resized image:', e);
+    }
+  } else {
+    console.warn('OpenCV.js not ready — skipping CLAHE. Predictions may not match training-time preprocessing.');
+  }
+
   const probs = tf.tidy(() => {
-    let tensor = tf.browser.fromPixels(currentImage);
-    tensor = tf.image.resizeBilinear(tensor, [224, 224]);
-    // Standard ImageNet / DenseNet scaling: (x / 127.5) - 1.0
-    tensor = tensor.cast('float32').div(127.5).sub(1.0);
+    let tensor = tf.browser.fromPixels(inputCanvas); // RGB, 224x224x3, 0-255
+    tensor = tensor.toFloat().div(255.0);
+    const mean = tf.tensor1d([0.485, 0.456, 0.406]);
+    const std  = tf.tensor1d([0.229, 0.224, 0.225]);
+    tensor = tensor.sub(mean).div(std);
     tensor = tensor.expandDims(0);
     return tfModel.predict(tensor).dataSync();
   });
 
   const out = {};
-  for(let i=0; i<CLASS_NAMES.length; i++) {
+  for (let i = 0; i < CLASS_NAMES.length; i++) {
     out[CLASS_NAMES[i]] = probs[i];
   }
   return out;
@@ -270,41 +452,117 @@ async function tfPredict() {
 
 // ── Demo Predictor ────────────────────────────────────────────────────
 function demoPredict() {
-  // Randomly pick a "dominant" class with high probability
   const dominant = CLASS_NAMES[Math.floor(Math.random() * CLASS_NAMES.length)];
   const raw = {};
   CLASS_NAMES.forEach(c => {
     raw[c] = c === dominant
-      ? 0.70 + Math.random() * 0.25      // 70–95% for dominant
-      : Math.random() * 0.15;             // small noise for others
+      ? 0.70 + Math.random() * 0.25
+      : Math.random() * 0.15;
   });
-  // Softmax normalise
   const total = Object.values(raw).reduce((a, b) => a + b, 0);
   const out = {};
   CLASS_NAMES.forEach(c => { out[c] = raw[c] / total; });
   return out;
 }
 
-// ── Display Results ───────────────────────────────────────────────────
-function displayResults(predictions) {
-  hide(loadingState);
-  show(resultsContent);
+// ── Batch Summary ─────────────────────────────────────────────────────
+function renderBatchSummary() {
+  const total = results.length;
+  const counts = {};
+  CLASS_NAMES.forEach(c => counts[c] = 0);
+  let uncertainCount = 0;
 
-  // Find top class
+  results.forEach(r => {
+    if (r.isUncertain || !r.predictions) { uncertainCount++; return; }
+    const top = Object.entries(r.predictions).sort((a, b) => b[1] - a[1])[0][0];
+    counts[top]++;
+  });
+
+  let chipsHtml = `
+    <div class="summary-chip"><div class="s-val">${total}</div><div class="s-lbl">Images Analysed</div></div>
+  `;
+  CLASS_NAMES.forEach(c => {
+    chipsHtml += `<div class="summary-chip"><div class="s-val" style="color:${CLASS_COLORS[c]}">${counts[c]}</div><div class="s-lbl">${CLASS_ICONS[c]} ${c}</div></div>`;
+  });
+  chipsHtml += `<div class="summary-chip"><div class="s-val" style="color:#B0BEC5">${uncertainCount}</div><div class="s-lbl">❓ Uncertain</div></div>`;
+
+  batchSummaryGrid.innerHTML = chipsHtml;
+}
+
+// ── Batch Result Cards ────────────────────────────────────────────────
+function renderResultCards() {
+  resultCardsGrid.innerHTML = '';
+  items.forEach((it, idx) => {
+    const r = results[idx];
+    const card = document.createElement('div');
+    card.className = 'result-card';
+
+    if (r.isUncertain || !r.predictions) {
+      card.classList.add('uncertain');
+      const badgeText = r.loadFailed ? '⚠️ Failed to load' : (r.flaggedNotXray ? '❓ Not an X-ray' : '❓ Uncertain');
+      card.innerHTML = `
+        <img src="${it.url}" alt="${escapeHtml(it.name)}" />
+        <div class="result-card-body">
+          <div class="result-card-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+          <div class="result-card-badge uncertain">${badgeText}</div>
+        </div>`;
+    } else {
+      const sorted   = Object.entries(r.predictions).sort((a, b) => b[1] - a[1]);
+      const topClass = sorted[0][0];
+      const topConf  = sorted[0][1];
+      card.style.setProperty('--card-accent', CLASS_COLORS[topClass]);
+      card.innerHTML = `
+        <img src="${it.url}" alt="${escapeHtml(it.name)}" />
+        <div class="result-card-body">
+          <div class="result-card-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</div>
+          <div class="result-card-badge" style="background:${CLASS_COLORS[topClass]}22; color:${CLASS_COLORS[topClass]}; border-color:${CLASS_COLORS[topClass]}55">
+            ${CLASS_ICONS[topClass]} ${topClass} · ${(topConf * 100).toFixed(1)}%
+          </div>
+        </div>`;
+    }
+
+    card.addEventListener('click', () => showDetail(idx));
+    resultCardsGrid.appendChild(card);
+  });
+}
+
+// ── Detail View for one image ─────────────────────────────────────────
+function showDetail(idx) {
+  const it = items[idx];
+  const r  = results[idx];
+  detailFileName.textContent = it.name;
+  show(detailView);
+  detailView.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  if (r.isUncertain || !r.predictions) {
+    verdictClass.textContent = 'Uncertain';
+    verdictConf.textContent  = r.loadFailed
+      ? "This image couldn't be decoded by the browser (unsupported format or corrupted file)"
+      : (r.flaggedNotXray
+          ? "Doesn't look like a grayscale chest X-ray"
+          : `Low confidence (${(r.maxProb * 100).toFixed(1)}%) — likely not a recognized X-ray pattern`);
+    verdictIcon.textContent  = '❓';
+    verdictCard.style.borderLeftColor = '#B0BEC5';
+    classBars.innerHTML  = '';
+    summaryGrid.innerHTML = '';
+    drawGradCAM(it.img, null);
+    return;
+  }
+
+  displayDetailResults(it.img, r.predictions);
+}
+
+// ── Display Results (single image, used by Detail View) ──────────────
+function displayDetailResults(imgEl, predictions) {
   const sorted    = Object.entries(predictions).sort((a, b) => b[1] - a[1]);
   const topClass  = sorted[0][0];
   const topConf   = sorted[0][1];
 
-  // Verdict
   verdictClass.textContent = topClass;
   verdictConf.textContent  = `Confidence: ${(topConf * 100).toFixed(2)}%`;
   verdictIcon.textContent  = CLASS_ICONS[topClass];
-  verdictCard.style.setProperty('--card-color', CLASS_COLORS[topClass]);
-  verdictCard.querySelector('::before');
-  // colour the left border
   verdictCard.style.borderLeftColor = CLASS_COLORS[topClass];
 
-  // Class bars
   classBars.innerHTML = '';
   sorted.forEach(([cls, prob]) => {
     const pct   = (prob * 100).toFixed(2);
@@ -325,14 +583,12 @@ function displayResults(predictions) {
     classBars.appendChild(bar);
   });
 
-  // Animate bars after render
   requestAnimationFrame(() => {
-    document.querySelectorAll('.bar-fill').forEach(el => {
+    classBars.querySelectorAll('.bar-fill').forEach(el => {
       el.style.width = el.dataset.pct + '%';
     });
   });
 
-  // Summary chips
   const entropy = -Object.values(predictions)
     .filter(p => p > 0)
     .reduce((sum, p) => sum + p * Math.log2(p), 0);
@@ -343,12 +599,11 @@ function displayResults(predictions) {
     <div class="summary-chip"><div class="s-val">${CLASS_NAMES.length}</div><div class="s-lbl">Classes Checked</div></div>
   `;
 
-  // Draw Grad-CAM canvases (simulated heatmap)
-  drawGradCAM(topClass);
+  drawGradCAM(imgEl, topClass);
 }
 
 // ── Grad-CAM (Simulated) ──────────────────────────────────────────────
-function drawGradCAM(topClass) {
+function drawGradCAM(imgEl, topClass) {
   const W = 224, H = 224;
   const orig  = document.getElementById('origCanvas');
   const heat  = document.getElementById('heatCanvas');
@@ -356,12 +611,18 @@ function drawGradCAM(topClass) {
 
   [orig, heat, blend].forEach(c => { c.width = W; c.height = H; });
 
-  // Draw original image
   const ctxO = orig.getContext('2d');
-  if (currentImage) ctxO.drawImage(currentImage, 0, 0, W, H);
-  else { ctxO.fillStyle = '#1a2235'; ctxO.fillRect(0,0,W,H); }
+  if (imgEl) ctxO.drawImage(imgEl, 0, 0, W, H);
+  else { ctxO.fillStyle = '#1a2235'; ctxO.fillRect(0, 0, W, H); }
 
-  // Generate simulated Gaussian heatmap focused on lung region
+  if (!topClass) {
+    heat.getContext('2d').clearRect(0, 0, W, H);
+    const ctxB = blend.getContext('2d');
+    ctxB.clearRect(0, 0, W, H);
+    if (imgEl) ctxB.drawImage(imgEl, 0, 0, W, H);
+    return;
+  }
+
   const imgData = heat.getContext('2d').createImageData(W, H);
   const cx = W * 0.5 + (Math.random() - .5) * 40;
   const cy = H * 0.52 + (Math.random() - .5) * 30;
@@ -370,7 +631,7 @@ function drawGradCAM(topClass) {
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const d2  = ((x-cx)**2 + (y-cy)**2) / (2 * sig**2);
-      const v   = Math.exp(-d2);   // 0-1, peak at centre
+      const v   = Math.exp(-d2);
       const rgb = jetColormap(v);
       const idx = (y * W + x) * 4;
       imgData.data[idx]   = rgb[0];
@@ -381,21 +642,14 @@ function drawGradCAM(topClass) {
   }
   heat.getContext('2d').putImageData(imgData, 0, 0);
 
-  // Blend original + heatmap (alpha = 0.45)
   const ctxB = blend.getContext('2d');
-  if (currentImage) ctxB.drawImage(currentImage, 0, 0, W, H);
+  if (imgEl) ctxB.drawImage(imgEl, 0, 0, W, H);
   ctxB.globalAlpha = 0.5;
   ctxB.drawImage(heat, 0, 0, W, H);
   ctxB.globalAlpha = 1.0;
 }
 
-// Jet colormap: value 0-1 → [R,G,B]
 function jetColormap(v) {
-  const t  = v * 3;
-  const r  = Math.round(255 * Math.min(Math.max(Math.min(t - 1.5, 4.5 - t), 0), 1));
-  const g  = Math.round(255 * Math.min(Math.max(Math.min(t - 0.5, 3.5 - t), 0), 1));
-  const b  = Math.round(255 * Math.min(Math.max(Math.min(t + 0.5, 2.5 - t), 0), 1));
-  // Classic jet: blue → cyan → green → yellow → red
   const vv = Math.max(0, Math.min(1, v));
   const r2 = vv < .5 ? 0 : (vv < .75 ? (vv - .5) * 4 : 1);
   const g2 = vv < .25 ? vv * 4 : (vv < .75 ? 1 : (1 - vv) * 4);
@@ -417,3 +671,6 @@ function copyCode() {
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
